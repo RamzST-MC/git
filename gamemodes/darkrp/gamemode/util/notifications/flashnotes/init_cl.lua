@@ -1,0 +1,111 @@
+local flashnotes = {}
+local PANEL = {}
+function PANEL:Init()
+	self.Title = ui.Create('DLabel', function(s, p)
+		s:SetColor(ui.col.White)
+		s:SetFont('ui.22')
+	end, self)
+end
+
+function PANEL:SetInfo(title, text)
+	local w, h = 275, 26
+	local newW = 0
+	text = string.Wrap('ui.20', text, w - 10)
+	surface.SetFont('ui.22')
+	local tW = surface.GetTextSize(title)
+	newW = tW + 10
+	surface.SetFont('ui.20')
+	for k, v in ipairs(text) do
+		if v ~= '' then
+			local tW = surface.GetTextSize(v)
+			if tW > newW then newW = tW end
+			ui.Create('DLabel', function(s, p)
+				s:SetText(v)
+				s:SetPos(5, 26 + ((k - 1) * s:GetTall()))
+				s:SetColor(ui.col.White)
+				s:SetFont('ui.18')
+				s:SizeToContents()
+				h = h + s:GetTall()
+			end, self)
+		end
+	end
+
+	self:SetSize(newW + 10, h + 2)
+	self:SetAlpha(0)
+	self:FadeIn(0.2)
+	self:SetPos(ScrW() * .5 - self:GetWide() * .5, ScrH() * .1)
+	self.End = CurTime() + 3.4
+	self.Title:SetText(title)
+	hook('Think', self, function() if self.animation then self.animation:Run() end end)
+	timer.Simple(3, function()
+		if IsValid(self) then
+			self:FadeOut(0.2, function()
+				flashnotes[self.ID] = nil
+				self:Remove()
+			end)
+		end
+	end)
+end
+
+function PANEL:PerformLayout()
+	self.Title:SizeToContents()
+	self.Title:SetPos((self:GetWide() * 0.5) - (self.Title:GetWide() * 0.5), 2)
+end
+
+local color_background = Color(10,10,10,160)
+-- color_background.a = 255
+local bar_color = Color(44,97,183)
+function PANEL:Paint(w, h)
+	if hook.Call('HUDShouldDraw', GAMEMODE, 'FashNotes') == false then return end
+	draw.RoundedBox(5, 0, 0, w, h, color_background)
+	draw.RoundedBoxEx(5, 0, 0, w, 26, color_background, true, true, false, false)
+	draw.Gradient(0, 0, w * ((self.End - CurTime()) / 3.4), 26, 1, bar_color)
+end
+
+function PANEL:FadeIn(speed, cback)
+	self.animation = Derma_Anim('Fade Panel', self, function(panel, animation, delta, data)
+		panel:SetAlpha(delta * 255)
+		if animation.Finished then
+			self.animation = nil
+			if cback then cback() end
+		end
+	end)
+
+	if self.animation then self.animation:Start(speed) end
+end
+
+function PANEL:FadeOut(speed, cback)
+	self.animation = Derma_Anim('Fade Panel', self, function(panel, animation, delta, data)
+		panel:SetAlpha(255 - (delta * 255))
+		if animation.Finished then
+			self.animation = nil
+			if cback then cback() end
+		end
+	end)
+
+	if self.animation then self.animation:Start(speed) end
+end
+
+vgui.Register('rp_flashnotification', PANEL, 'Panel')
+function rp.FlashNotify(title, text)
+	local note = ui.Create('rp_flashnotification')
+	note:SetInfo(title, text)
+	note.ID = 1
+	for k, v in ipairs(flashnotes) do
+		v.ID = v.ID + 1
+		local x, y = v:GetPos()
+		v:SetPos(x, y + note:GetTall() + 4, 0.2)
+	end
+
+	table.insert(flashnotes, 1, note)
+end
+
+net('rp.FlashString', function()
+	if not IsValid(LocalPlayer()) then return end
+	rp.FlashNotify(net.ReadString(), rp.ReadMsg())
+end)
+
+net('rp.FlashTerm', function()
+	if not IsValid(LocalPlayer()) then return end
+	rp.FlashNotify(net.ReadString(), net.ReadTerm())
+end)

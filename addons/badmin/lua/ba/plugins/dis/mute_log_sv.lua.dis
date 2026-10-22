@@ -1,0 +1,65 @@
+-- mute_log_sv.lua
+-- Сохраняет муты чата и голоса в БД, чтобы их видело меню истории наказаний.
+-- MySQL. Таблицы: ba_mute_chat и ba_mute_voice (имена, которые ищет punishment_menu.lua).
+
+local db = ba.data.GetDB()
+
+local function EnsureTables()
+	for _, tbl in ipairs({'ba_mute_chat', 'ba_mute_voice'}) do
+		db:query('CREATE TABLE IF NOT EXISTS `' .. tbl .. '` (' ..
+			'`steamid` VARCHAR(32) NOT NULL, `name` VARCHAR(128), `reason` TEXT, ' ..
+			'`a_steamid` VARCHAR(32), `a_name` VARCHAR(128), ' ..
+			'`mute_time` BIGINT, `mute_len` BIGINT, ' ..
+			'`unmute_time` BIGINT DEFAULT 0, `unmute_reason` TEXT, ' ..
+			'INDEX (`steamid`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
+	end
+end
+EnsureTables()
+
+local function ParseTime(raw)
+	if isnumber(raw) then return raw end
+	local s = 0
+	for k, t in string.gmatch(tostring(raw or ''):lower(), '(%d+)(%a+)') do
+		s = s + k * (ba.NumberUntits[t] or 0)
+	end
+	return s
+end
+
+local function AdminInfo(admin)
+	if IsValid(admin) and admin:IsPlayer() then
+		return admin:SteamID64(), admin:Name()
+	end
+	return '0', 'Console'
+end
+
+local function LogMute(tbl, admin, target, rawtime, reason)
+	if not IsValid(target) then return end
+	local a_sid, a_name = AdminInfo(admin)
+	db:query_ex('INSERT INTO ' .. tbl .. '(steamid, name, reason, a_steamid, a_name, mute_time, mute_len, unmute_time) ' ..
+		'VALUES("?", "?", "?", "?", "?", "?", "?", "0");',
+		{target:SteamID64(), target:Name(), reason or '', a_sid, a_name, os.time(), ParseTime(rawtime)})
+end
+
+local function LogUnmute(tbl, admin, target)
+	if not IsValid(target) then return end
+	local a_sid, a_name = AdminInfo(admin)
+	db:query_ex('UPDATE ' .. tbl .. ' SET unmute_time="?", unmute_reason="?" ' ..
+		'WHERE steamid="?" AND unmute_time="0";',
+		{os.time(), '0 [' .. a_name .. ']', target:SteamID64()})
+end
+
+hook.Add('BA_PlayerChatMuted', 'ba.MuteLog.Chat', function(admin, target, rawtime, reason)
+	LogMute('ba_mute_chat', admin, target, rawtime, reason)
+end)
+
+hook.Add('BA_PlayerVoiceMuted', 'ba.MuteLog.Voice', function(admin, target, rawtime, reason)
+	LogMute('ba_mute_voice', admin, target, rawtime, reason)
+end)
+
+hook.Add('BA_PlayerChatUnmuted', 'ba.MuteLog.ChatUn', function(admin, target)
+	LogUnmute('ba_mute_chat', admin, target)
+end)
+
+hook.Add('BA_PlayerVoiceUnmuted', 'ba.MuteLog.VoiceUn', function(admin, target)
+	LogUnmute('ba_mute_voice', admin, target)
+end)

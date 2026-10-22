@@ -1,0 +1,496 @@
+-------------------------------------------------
+-- Мультиаккаунты и блокировка аккаунтов
+--
+-- Аккаунты считаются связанными, если у них совпадает:
+--   * IP-адрес     (таблица ba_iplog)   - слабая связь: IP бывают общими (семья, клуб, мобильная сеть);
+--   * ID устройства (таблица ba_hashlog) - сильная связь: ключ, который клиент хранит на своём компьютере.
+--
+-- Что делает система:
+--   * при входе игрока ищет связанные аккаунты и предупреждает штат;
+--   * если связан с ЗАБАНЕННЫМ аккаунтом (обход бана) - блокирует и этот аккаунт (см. CFG.AutoAction);
+--   * /alts       <ник|steamid>                 - меню со связанными аккаунтами;
+--   * /banalts    <ник|steamid> <время> <причина> - заблокировать игрока и ВСЕ его связанные аккаунты;
+--   * /altwhitelist <ник|steamid>               - добавить/убрать из белого списка (семья, один ПК, клуб).
+-------------------------------------------------
+
+local CFG = {
+	-- права (иммунитет ранга): helper = 5000, admin = 6000
+	ViewImmunity 	= 5000, -- /alts и уведомления
+	BanImmunity 	= 6000, -- /banalts и /altwhitelist
+
+	-- IP старше этого срока не учитываем (дни)
+	IPMaxAgeDays 	= 60,
+
+	-- Что делать, если новый аккаунт связан с забаненным:
+	--   'ban' - забанить новый аккаунт на тот же срок, 'kick' - только кикнуть, 'notify' - только уведомить штат
+	AutoAction 		= 'ban',
+	AutoOnHash 		= true,  -- совпал ID устройства
+	AutoOnIP 		= false, -- совпал только IP (по умолчанию выключено: слишком много ложных срабатываний)
+
+	-- Когда проверять игрока после входа (секунды): ID устройства клиент присылает не сразу
+	CheckDelays 	= {3, 20, 75},
+
+	-- Не больше стольких связанных аккаунтов показываем/баним
+	MaxLinks 		= 25,
+}
+
+term.Add('AltsDetected', 	'Возможный мультиаккаунт: # связан с аккаунтами: #')
+term.Add('AltsEvasion', 	'Обход бана: # связан с забаненным аккаунтом # - #')
+term.Add('AltsBanned', 		'# заблокировал связанные аккаунты (#) игрока #. Причина: #')
+term.Add('AltsWLAdd', 		'# добавил # в белый список мультиаккаунтов')
+term.Add('AltsWLRemove', 	'# убрал # из белого списка мультиаккаунтов')
+
+local ALT = {}
+
+local function immunity(pl)
+	if not isplayer(pl) then return math.huge end -- консоль сервера
+	local r = pl:GetRankTable()
+	return (r and r:GetImmunity()) or 0
+end
+
+-------------------------------------------------
+-- Сервер
+-------------------------------------------------
+if (SERVER) then
+	util.AddNetworkString('ba.AltsMenu')
+
+	local db = ba.data.GetDB()
+	local whitelist = {} -- [steamid64] = true
+
+	-- Имена колонок в ba_iplog / ba_hashlog в разных базах отличаются.
+	-- Логгер пишет по позиции: (steamid, время, значение) - берём имена из самой таблицы.
+	local COL = {
+		ip   = {time = 'lastseen', val = 'ip'},
+		hash = {time = 'lastseen', val = 'hashid'},
+	}
+
+	local function detectColumns()
+		for tbl, key in pairs({ba_iplog = 'ip', ba_hashlog = 'hash'}) do
+			db:query('SHOW COLUMNS FROM `' .. tbl .. '`', function(cols)
+				if istable(cols) and cols[2] and cols[3] then
+					COL[key].time = tostring(cols[2].Field)
+					COL[key].val  = tostring(cols[3].Field)
+				end
+			end)
+		end
+	end
+
+	local DDL_MYSQL = [[CREATE TABLE IF NOT EXISTS ba_alt_whitelist (
+		steamid BIGINT(20) NOT NULL, name VARCHAR(64), a_name VARCHAR(64), added INT(11),
+		PRIMARY KEY (steamid)) ENGINE=InnoDB DEFAULT CHARSET=utf8;]]
+
+	local function listOf(token, n)
+		local t = {}
+		for i = 1, n do t[i] = token end
+		return table.concat(t, ',')
+	end
+
+	local function loadWhitelist()
+		db:query('SELECT CAST(steamid AS CHAR) AS steamid FROM ba_alt_whitelist', function(data)
+			whitelist = {}
+			for _, r in ipairs(data) do whitelist[tostring(r.steamid)] = true end
+		end)
+	end
+
+	local function getName(target, cback)
+		if isplayer(target) then return cback(target:Nick()) end
+
+		db:query_ex('SELECT name FROM ba_users WHERE steamid=?', {ba.InfoTo64(target)}, function(d)
+			cback((d[1] and d[1].name) or 'Неизвестный')
+		end)
+	end
+
+	-------------------------------------------------
+	-- Поиск связанных аккаунтов
+	-- cback(links): links[steamid64] = {ip = bool, hash = bool}
+	-------------------------------------------------
+	function ALT.Find(sid, cback)
+		sid = tostring(sid)
+		local cutoff = os.time() - CFG.IPMaxAgeDays * 86400
+		local ips, hashes = {}, {}
+		local pending = 2
+
+		local function stage2()
+			local links = {}
+
+			local function add(owner, kind)
+				owner = tostring(owner)
+				if (owner == sid) or whitelist[owner] or whitelist[sid] then return end
+
+				links[owner] = links[owner] or {ip = false, hash = false}
+				links[owner][kind] = true
+			end
+
+			local jobs = ((#ips > 0) and 1 or 0) + ((#hashes > 0) and 1 or 0)
+			if (jobs == 0) then return cback(links) end
+
+			local function done()
+				jobs = jobs - 1
+				if (jobs == 0) then cback(links) end
+			end
+
+			if (#ips > 0) then
+				local params = {}
+				for _, ip in ipairs(ips) do params[#params + 1] = ip end
+				params[#params + 1] = cutoff
+
+				db:query_ex('SELECT CAST(steamid AS CHAR) AS steamid FROM ba_iplog WHERE `' .. COL.ip.val .. '` IN (' .. listOf('"?"', #ips) .. ') AND `' .. COL.ip.time .. '` > ?', params, function(d)
+					for _, r in ipairs(d or {}) do add(r.steamid, 'ip') end
+					done()
+				end)
+			end
+
+			if (#hashes > 0) then
+				db:query_ex('SELECT CAST(steamid AS CHAR) AS steamid FROM ba_hashlog WHERE `' .. COL.hash.val .. '` IN (' .. listOf('"?"', #hashes) .. ')', hashes, function(d)
+					for _, r in ipairs(d or {}) do add(r.steamid, 'hash') end
+					done()
+				end)
+			end
+		end
+
+		local function stepDone()
+			pending = pending - 1
+			if (pending == 0) then stage2() end
+		end
+
+		db:query_ex('SELECT `' .. COL.ip.val .. '` AS v FROM ba_iplog WHERE steamid=? AND `' .. COL.ip.time .. '` > ? ORDER BY `' .. COL.ip.time .. '` DESC LIMIT 20', {sid, cutoff}, function(d)
+			for _, r in ipairs(d or {}) do ips[#ips + 1] = tostring(r.v) end
+			stepDone()
+		end)
+
+		db:query_ex('SELECT `' .. COL.hash.val .. '` AS v FROM ba_hashlog WHERE steamid=? ORDER BY `' .. COL.hash.time .. '` DESC LIMIT 20', {sid}, function(d)
+			for _, r in ipairs(d or {}) do hashes[#hashes + 1] = tostring(r.v) end
+			stepDone()
+		end)
+	end
+
+	-- строки для меню/уведомлений: ник, статус, тип связи
+	function ALT.Describe(links, cback)
+		local ids = {}
+		for owner in pairs(links) do ids[#ids + 1] = owner end
+
+		-- сначала самые уверенные связи (устройство + IP), потом остальные
+		local function rank(l) return (l.hash and 2 or 0) + (l.ip and 1 or 0) end
+		table.sort(ids, function(a, b) return rank(links[a]) > rank(links[b]) end)
+		for i = #ids, CFG.MaxLinks + 1, -1 do ids[i] = nil end
+
+		if (#ids == 0) then return cback({}) end
+
+		db:query_ex('SELECT CAST(steamid AS CHAR) AS steamid, name, lastseen FROM ba_users WHERE steamid IN (' .. listOf('?', #ids) .. ')', ids, function(d)
+			local info = {}
+			for _, r in ipairs(d) do info[tostring(r.steamid)] = r end
+
+			local online = {}
+			for _, p in ipairs(player.GetAll()) do online[p:SteamID64()] = p end
+
+			local rows = {}
+			for _, owner in ipairs(ids) do
+				local l, i = links[owner], info[owner]
+				local banned, ban = ba.bans.IsBanned(owner)
+
+				rows[#rows + 1] = {
+					sid 		= owner,
+					name 		= (online[owner] and online[owner]:Nick()) or (i and i.name) or 'Неизвестный',
+					link 		= (l.hash and l.ip) and 'both' or (l.hash and 'hash' or 'ip'),
+					lastseen 	= (i and tonumber(i.lastseen)) or 0,
+					online 		= online[owner] ~= nil,
+					banned 		= banned and true or false,
+					reason 		= (banned and ban and tostring(ban.reason or '')) or '',
+				}
+			end
+
+			cback(rows)
+		end)
+	end
+
+	local LINK_TEXT = {ip = 'IP', hash = 'устройство', both = 'IP + устройство'}
+
+	local function summary(rows)
+		local parts = {}
+		for i = 1, math.min(#rows, 4) do
+			local r = rows[i]
+			parts[#parts + 1] = r.name .. ' (' .. LINK_TEXT[r.link] .. (r.banned and ', ЗАБАНЕН' or '') .. ')'
+		end
+		if (#rows > 4) then parts[#parts + 1] = 'и ещё ' .. (#rows - 4) end
+		return table.concat(parts, '; ')
+	end
+
+	-------------------------------------------------
+	-- Проверка при входе
+	-------------------------------------------------
+	local function check(pl)
+		if not IsValid(pl) then return end
+
+		local sid = pl:SteamID64()
+		pl.BA_AltSeen = pl.BA_AltSeen or {}
+
+		ALT.Find(sid, function(links)
+			if not IsValid(pl) then return end
+
+			-- только то, что ещё не показывали
+			local fresh = {}
+			for owner, l in pairs(links) do
+				if not pl.BA_AltSeen[owner] then
+					pl.BA_AltSeen[owner] = true
+					fresh[owner] = l
+				end
+			end
+			if (next(fresh) == nil) then return end
+
+			ALT.Describe(fresh, function(rows)
+				if not IsValid(pl) then return end
+
+				ba.notify_staff(term.Get('AltsDetected'), pl, summary(rows))
+				hook.Call('BA_MultiAccountDetected', nil, pl, rows)
+
+				-- обход бана
+				if (CFG.AutoAction == 'notify') or ba.bans.IsBanned(sid) then return end
+
+				for _, r in ipairs(rows) do
+					local strong = (r.link ~= 'ip') and CFG.AutoOnHash
+					local weak 	 = (r.link == 'ip') and CFG.AutoOnIP
+
+					if r.banned and (strong or weak or ((r.link == 'both') and CFG.AutoOnIP)) then
+						local _, ban = ba.bans.IsBanned(r.sid)
+						local len = 0 -- навсегда
+						if ban and (tonumber(ban.unban_time) or 0) > 0 then
+							len = math.max(60, tonumber(ban.unban_time) - os.time())
+						end
+
+						local reason = 'Обход бана: связан с аккаунтом ' .. r.name .. ' (' .. r.sid .. ')'
+
+						ba.notify_staff(term.Get('AltsEvasion'), pl, r.name, (CFG.AutoAction == 'ban') and 'аккаунт заблокирован' or 'игрок кикнут')
+
+						if (CFG.AutoAction == 'ban') then
+							ba.bans.Ban(pl, reason, len, nil)
+						else
+							pl:Kick(reason)
+						end
+						return
+					end
+				end
+			end)
+		end)
+	end
+
+	hook.Add('playerRankLoaded', 'ba.multiaccount', function(pl)
+		for _, delay in ipairs(CFG.CheckDelays) do
+			timer.Simple(delay, function() check(pl) end)
+		end
+	end)
+
+	-------------------------------------------------
+	-- Меню /alts
+	-------------------------------------------------
+	function ALT.SendMenu(pl, target)
+		local sid = ba.InfoTo64(target)
+
+		getName(target, function(name)
+			ALT.Find(sid, function(links)
+				ALT.Describe(links, function(rows)
+					if not IsValid(pl) then return end
+
+					local packed = util.Compress(pon.encode({
+						sid 		= sid,
+						name 		= name,
+						whitelisted = whitelist[sid] or false,
+						rows 		= rows,
+					}))
+
+					net.Start('ba.AltsMenu')
+						net.WriteUInt(#packed, 32)
+						net.WriteData(packed, #packed)
+					net.Send(pl)
+				end)
+			end)
+		end)
+	end
+
+	-------------------------------------------------
+	-- Блокировка игрока и всех его аккаунтов
+	-------------------------------------------------
+	function ALT.BanAll(pl, target, reason, len)
+		local sid = ba.InfoTo64(target)
+		local myImmunity = immunity(pl)
+
+		getName(target, function(name)
+			ALT.Find(sid, function(links)
+				local count = 0
+
+				for owner in pairs(links) do
+					if not ba.bans.IsBanned(owner) then
+						-- аккаунты равных и старших рангов не трогаем
+						local id = ba.data.GetRank(owner)
+						local r = ba.ranks.Get(tonumber(id) or id)
+
+						if not (r and (r:GetImmunity() >= myImmunity)) then
+							ba.bans.Ban(owner, reason .. ' (мультиаккаунт ' .. name .. ')', len, pl)
+							count = count + 1
+						end
+					end
+				end
+
+				if not ba.bans.IsBanned(sid) then
+					ba.bans.Ban(target, reason, len, pl)
+				end
+
+				ba.notify_all(term.Get('AltsBanned'), pl, count, target, reason)
+			end)
+		end)
+	end
+
+	-------------------------------------------------
+	-- Белый список
+	-------------------------------------------------
+	function ALT.ToggleWhitelist(pl, target)
+		local sid = ba.InfoTo64(target)
+
+		if whitelist[sid] then
+			whitelist[sid] = nil
+			db:query_ex('DELETE FROM ba_alt_whitelist WHERE steamid=?', {sid})
+			ba.notify_all(term.Get('AltsWLRemove'), pl, target)
+			return
+		end
+
+		getName(target, function(name)
+			whitelist[sid] = true
+			db:query_ex('REPLACE INTO ba_alt_whitelist(steamid, name, a_name, added) VALUES(?,"?","?",?)',
+				{sid, name, isplayer(pl) and pl:Nick() or 'Консоль', os.time()})
+			ba.notify_all(term.Get('AltsWLAdd'), pl, target)
+		end)
+	end
+
+	-------------------------------------------------
+	-- Инициализация
+	-------------------------------------------------
+	db:query(DDL_MYSQL)
+	detectColumns()
+	loadWhitelist()
+end
+
+-------------------------------------------------
+-- Команды
+-------------------------------------------------
+local function noAccess(pl)
+	return ba.notify_err(pl, 'Недостаточно прав для этой команды.')
+end
+
+ba.cmd.Create('Alts', function(pl, args)
+	if not isplayer(pl) then return end
+	if (immunity(pl) < CFG.ViewImmunity) then return noAccess(pl) end
+
+	ALT.SendMenu(pl, args.target)
+end)
+:AddParam('player_steamid', 'target')
+:SetFlag('u') -- есть у всех рангов; реальная проверка выше (CFG.ViewImmunity)
+:SetHelp('Показать аккаунты, связанные с игроком по IP и устройству. Пример: /alts (ник)')
+:SetIcon('icon16/group_error.png')
+
+ba.cmd.Create('BanAlts', function(pl, args)
+	if (immunity(pl) < CFG.BanImmunity) then return noAccess(pl) end
+
+	local reason = string.Trim(args.reason or '')
+	if (reason == '') then return ba.notify_err(pl, 'Укажите причину!') end
+
+	ALT.BanAll(pl, args.target, reason, args.time)
+end)
+:AddParam('player_steamid', 'target')
+:AddParam('time', 'time')
+:AddParam('string', 'reason')
+:SetFlag('u')
+:SetHelp('Заблокировать игрока и ВСЕ его связанные аккаунты (0 = навсегда). Пример: /banalts (ник) 0 (причина)')
+:SetIcon('icon16/user_delete.png')
+
+ba.cmd.Create('AltWhitelist', function(pl, args)
+	if (immunity(pl) < CFG.BanImmunity) then return noAccess(pl) end
+	ALT.ToggleWhitelist(pl, args.target)
+end)
+:AddParam('player_steamid', 'target')
+:SetFlag('u')
+:SetHelp('Добавить/убрать игрока из белого списка мультиаккаунтов (семья, один ПК, клуб). Пример: /altwhitelist (ник)')
+:SetIcon('icon16/shield.png')
+
+-------------------------------------------------
+-- Клиент: меню
+-------------------------------------------------
+if (SERVER) then return end
+
+local LINK_TEXT = {ip = 'IP', hash = 'Устройство', both = 'IP + устройство'}
+local fr
+
+local function fmtDate(t)
+	return (not t or t == 0) and '-' or os.date('%d.%m.%Y %H:%M', t)
+end
+
+net.Receive('ba.AltsMenu', function()
+	local size = net.ReadUInt(32)
+	local data = pon.decode(util.Decompress(net.ReadData(size))) or {}
+	local rows = data.rows or {}
+
+	if IsValid(fr) then fr:Remove() end
+
+	fr = ui.Create('ui_frame', function(self)
+		self:SetSize(1150, 560)
+		self:SetTitle('Связанные аккаунты: ' .. tostring(data.name) .. (data.whitelisted and ' [в белом списке]' or '') .. ' (' .. #rows .. ')')
+		self:Center()
+		self:MakePopup()
+	end)
+
+	local list = ui.Create('DListView', function(self, p)
+		self:DockMargin(0, p:GetTitleHeight() - 29, 0, 0)
+		self:Dock(FILL)
+		self:SetMultiSelect(false)
+		self:AddColumn('Ник'):SetFixedWidth(250)
+		self:AddColumn('SteamID'):SetFixedWidth(160)
+		self:AddColumn('Связь'):SetFixedWidth(130)
+		self:AddColumn('Статус')
+		self:AddColumn('Последний вход'):SetFixedWidth(140)
+		self:SetHeaderHeight(25)
+	end, fr)
+
+	for _, r in ipairs(rows) do
+		local status = r.banned and ('ЗАБАНЕН: ' .. r.reason) or (r.online and 'В сети' or 'Не в сети')
+		local line = list:AddLine(r.name, util.SteamIDFrom64(r.sid), LINK_TEXT[r.link] or r.link, status, fmtDate(r.lastseen))
+		line.Row = r
+
+		if r.banned then
+			for _, c in ipairs(line.Columns) do c:SetTextColor(Color(255, 90, 90)) end
+		end
+	end
+
+	if (#rows == 0) then
+		list:AddLine('Связанных аккаунтов не найдено')
+	end
+
+	list.OnRowRightClick = function(_, id, line)
+		local r = line.Row
+		if not r then return end
+
+		local steamid = util.SteamIDFrom64(r.sid)
+		local menu = ui.DermaMenu()
+
+		menu:AddOption('Скопировать SteamID', function()
+			SetClipboardText(steamid)
+			chat.AddText(color_white, 'SteamID скопирован: ' .. steamid)
+		end)
+
+		menu:AddOption('Скопировать SteamID64', function()
+			SetClipboardText(r.sid)
+			chat.AddText(color_white, 'SteamID64 скопирован: ' .. r.sid)
+		end)
+
+		if not r.banned then
+			menu:AddOption('Заблокировать аккаунт (навсегда)', function()
+				Derma_StringRequest('Блокировка аккаунта', 'Причина блокировки:', 'Мультиаккаунт', function(text)
+					RunConsoleCommand('ba', 'ban', steamid, '0', text)
+				end)
+			end)
+		end
+
+		menu:AddOption('Добавить в белый список', function()
+			RunConsoleCommand('ba', 'altwhitelist', steamid)
+		end)
+
+		menu:Open()
+	end
+end)

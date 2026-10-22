@@ -1,0 +1,974 @@
+-- punishment_menu.lua
+if SERVER then
+AddCSLuaFile()
+end
+-- ==================== СЕРВЕРНАЯ ЧАСТЬ ====================
+if SERVER then
+util.AddNetworkString("ba.OpenPunishmentsMenu")
+util.AddNetworkString("ba.RequestPlayersList")
+util.AddNetworkString("ba.SendPlayersList")
+util.AddNetworkString("ba.OpenPlayerSelectMenu")
+print("=== punishment_menu.lua ЗАГРУЖЕН (СЕРВЕР) ===")
+local function NotifyPlayer(pl, text)
+if IsValid(pl) and pl.ChatPrint then
+pl:ChatPrint("[Наказания] " .. text)
+end
+end
+local function ParseDuration(duration)
+if not duration then return 0 end
+local dur = tostring(duration)
+local minutes = string.match(dur, "^(%d+)mi$")
+if minutes then return tonumber(minutes) * 60 end
+local hours = string.match(dur, "^(%d+)h$")
+if hours then return tonumber(hours) * 3600 end
+local days = string.match(dur, "^(%d+)d$")
+if days then return tonumber(days) * 86400 end
+local seconds = string.match(dur, "^(%d+)s$")
+if seconds then return tonumber(seconds) end
+local num = tonumber(dur)
+if num then return num end
+return 0
+end
+local PUNISH_TABLES = {
+{type = "ban", tbl = "ba_bans", time = "ban_time"},
+{type = "mute", tbl = "ba_mute_chat", time = "mute_time"},
+{type = "voice_mute", tbl = "ba_mute_voice", time = "mute_time"},
+}
+local function GetPunishmentsFromDB(steamid, punish_type, cback)
+local db = ba.data.GetDB()
+local sid = tostring(steamid)
+local steamid64 = string.match(sid, "^7656") and sid or util.SteamIDTo64(sid)
+local sources = {}
+for _, src in ipairs(PUNISH_TABLES) do
+if punish_type == "all" or punish_type == src.type then
+sources[#sources + 1] = src
+end
+end
+if not db or #sources == 0 or not steamid64 or steamid64 == "0" then
+cback({})
+return
+end
+local results, pending, finished = {}, #sources, false
+local function finish()
+if finished then return end
+finished = true
+table.sort(results, function(a, b)
+return (tonumber(a.ban_time or a.mute_time) or 0) > (tonumber(b.ban_time or b.mute_time) or 0)
+end)
+cback(results)
+end
+for _, src in ipairs(sources) do
+db:query_ex("SELECT * FROM `" .. src.tbl .. "` WHERE steamid=\"?\" ORDER BY `" .. src.time .. "` DESC", {steamid64}, function(data)
+if istable(data) then
+for _, row in ipairs(data) do
+row.punish_type = src.type
+results[#results + 1] = row
+end
+end
+pending = pending - 1
+if pending <= 0 then finish() end
+end)
+end
+timer.Simple(5, finish)
+end
+function ba.logs.OpenPlayerPunishments(pl, steamid, punish_type)
+if not IsValid(pl) then return end
+punish_type = punish_type or "all"
+GetPunishmentsFromDB(steamid, punish_type, function(data)
+if not IsValid(pl) then return end
+if #data == 0 then
+local type_names = {all = "наказаний", ban = "банов", mute = "мутов чата", voice_mute = "голосовых мутов"}
+NotifyPlayer(pl, "У игрока нет " .. (type_names[punish_type] or "наказаний") .. ".")
+return
+end
+net.Start("ba.OpenPunishmentsMenu")
+net.WriteString(steamid)
+net.WriteString(punish_type)
+net.WriteTable(data)
+net.Send(pl)
+end)
+end
+local function FindPlayerByNick(query)
+query = string.lower(query)
+for _, ply in ipairs(player.GetAll()) do
+if string.lower(ply:Nick()) == query then return ply end
+end
+for _, ply in ipairs(player.GetAll()) do
+if string.find(string.lower(ply:Nick()), query, 1, true) then return ply end
+end
+return nil
+end
+local function GetPlayersList()
+local list = {}
+for _, ply in ipairs(player.GetAll()) do
+list[#list + 1] = {
+name = ply:Nick(),
+steamid = ply:SteamID(),
+userid = ply:UserID(),
+admin = ply:IsAdmin() or ply:IsSuperAdmin()
+}
+end
+return list
+end
+net.Receive("ba.RequestPlayersList", function(len, pl)
+if not IsValid(pl) then return end
+if not pl:IsAdmin() and not pl:IsSuperAdmin() then return end
+local players = GetPlayersList()
+net.Start("ba.SendPlayersList")
+net.WriteTable(players)
+net.Send(pl)
+end)
+local function ProcessCommand(pl, query, isAdmin, punish_type)
+if isAdmin and not pl:IsAdmin() and not pl:IsSuperAdmin() then
+NotifyPlayer(pl, "Только для администраторов!")
+return
+end
+if not query or tostring(query) == "" then
+net.Start("ba.OpenPlayerSelectMenu")
+net.Send(pl)
+return
+end
+query = tostring(query)
+query = string.gsub(query, '"', '')
+query = string.Trim(query)
+local target = FindPlayerByNick(query)
+if target then
+query = target:SteamID()
+end
+if not string.find(query, "STEAM_", 1, true) and not string.find(query, "^7656", 1, true) then
+NotifyPlayer(pl, "Неверный SteamID или игрок не найден: " .. query)
+return
+end
+ba.logs.OpenPlayerPunishments(pl, query, punish_type)
+end
+if ba and ba.cmd then
+ba.cmd.Create('punishhistory', function(pl, args)
+local success, err = pcall(function()
+local query = args.target or ""
+ProcessCommand(pl, query, true, "all")
+end)
+if not success then
+print("[punishhistory ERROR]", err)
+end
+return true
+end)
+:AddParam('string', 'target', true)
+:SetFlag('ac')
+:SetIcon('icon16/application_view_list.png')
+:SetHelp('Открыть историю наказаний игрока')
+:AddAlias('ph')
+ba.cmd.Create('punishhistory_type', function(pl, args)
+local success, err = pcall(function()
+print("[DEBUG] punishhistory_type вызвана, args:", type(args))
+local query = ""
+local punish_type = "all"
+if type(args) == "table" then
+query = args[1] or args.target or ""
+punish_type = args[2] or args.type or "all"
+elseif type(args) == "string" then
+local parts = string.Split(args, " ")
+query = parts[1] or ""
+punish_type = parts[2] or "all"
+end
+print("[DEBUG] query:", query, "punish_type:", punish_type)
+if punish_type ~= "all" and punish_type ~= "ban" and punish_type ~= "mute" and punish_type ~= "voice_mute" then
+punish_type = "all"
+end
+ProcessCommand(pl, query, true, punish_type)
+end)
+if not success then
+print("[punishhistory_type ERROR]", err)
+end
+return true
+end)
+:AddParam('string', 'target', true)
+:AddParam('string', 'type', true)
+:SetFlag('ac')
+:SetHelp('Открыть историю наказаний определённого типа')
+ba.cmd.Create('playerpunishments', function(pl, args)
+return true
+end)
+:SetFlag('M')
+:SetHelp('История наказаний (требует флаг M)')
+end
+concommand.Add("ba_mypunish", function(pl, cmd, args)
+if not IsValid(pl) then return end
+local success, err = pcall(function()
+ba.logs.OpenPlayerPunishments(pl, pl:SteamID(), "all")
+end)
+if not success then
+print("[mypunish ERROR]", err)
+end
+end)
+end
+-- ==================== КЛИЕНТСКАЯ ЧАСТЬ ====================
+if CLIENT then
+print("=== punishment_menu.lua ЗАГРУЖЕН (КЛИЕНТ) ===")
+local COLOR_BG = Color(15, 18, 22, 245)
+local COLOR_HEADER = Color(8, 10, 12, 255)
+local COLOR_HEADER_TEXT = Color(230, 230, 230)
+local COLOR_CLOSE_BTN = Color(200, 200, 200)
+local COLOR_CLOSE_BTN_HOVER = Color(255, 255, 255)
+local COLOR_DIVIDER = Color(40, 45, 50)
+local COLOR_ROW_BG_1 = Color(22, 26, 30, 220)
+local COLOR_ROW_BG_2 = Color(28, 32, 36, 220)
+local COLOR_ROW_HOVER = Color(40, 48, 56, 230)
+local COLOR_ROW_SELECTED = Color(50, 60, 70, 240)
+local COLOR_TEXT = Color(210, 215, 220)
+local COLOR_TEXT_DIM = Color(120, 130, 140)
+local COLOR_STATUS_ACTIVE = Color(255, 80, 80)
+local COLOR_STATUS_EXPIRED = Color(255, 180, 60)
+local COLOR_STATUS_REMOVED = Color(100, 220, 120)
+local COLOR_ADMIN = Color(255, 210, 80)
+local COLOR_STEAMID = Color(130, 170, 255)
+local COLOR_FILTER_BG = Color(25, 30, 35, 240)
+local COLOR_FILTER_BORDER = Color(50, 60, 70)
+local COLOR_FILTER_TEXT = Color(220, 220, 220)
+local COLOR_FILTER_HOVER = Color(45, 55, 65, 240)
+local COLOR_FILTER_DROPDOWN = Color(18, 22, 26, 250)
+local COLOR_FILTER_ITEM_HOVER = Color(40, 50, 60, 240)
+local COLOR_HEADER_COL = Color(12, 14, 16, 255)
+local COLOR_HEADER_COL_TEXT = Color(140, 150, 160)
+local COLOR_BORDER = Color(35, 40, 45, 255)
+local COLOR_TYPE_BAN = Color(255, 100, 100)
+local COLOR_TYPE_MUTE = Color(255, 200, 80)
+local COLOR_TYPE_VOICE = Color(100, 200, 255)
+local COLOR_REASON_BG_1 = Color(30, 35, 45, 230)
+local COLOR_REASON_BG_2 = Color(35, 40, 52, 230)
+local COLOR_REASON_BORDER = Color(60, 70, 90, 200)
+local COLOR_REASON_TEXT = Color(230, 235, 245)
+local COLOR_REASON_HEADER = Color(25, 30, 45, 255)
+local COLOR_REASON_HEADER_TEXT = Color(180, 200, 230)
+local COLOR_STATUS_BG_1 = Color(30, 40, 35, 230)
+local COLOR_STATUS_BG_2 = Color(35, 45, 40, 230)
+local COLOR_STATUS_BORDER = Color(60, 90, 70, 200)
+local COLOR_STATUS_HEADER = Color(25, 40, 30, 255)
+local COLOR_STATUS_HEADER_TEXT = Color(180, 230, 200)
+local COLOR_LIST_BG = Color(15, 18, 22, 245)
+local COLOR_SCROLLBAR_BG = Color(20, 24, 28, 240)
+local COLOR_SCROLLBAR_BTN = Color(50, 60, 70, 240)
+local COLOR_UNBAN_BG_1 = Color(35, 30, 40, 230)
+local COLOR_UNBAN_BG_2 = Color(40, 35, 45, 230)
+local COLOR_UNBAN_BORDER = Color(80, 60, 100, 200)
+local COLOR_UNBAN_TEXT = Color(220, 200, 240)
+local COLOR_UNBAN_HEADER = Color(30, 25, 40, 255)
+local COLOR_UNBAN_HEADER_TEXT = Color(200, 180, 230)
+local COLOR_ENDTIME_BG_1 = Color(30, 35, 40, 230)
+local COLOR_ENDTIME_BG_2 = Color(35, 40, 45, 230)
+local COLOR_ENDTIME_BORDER = Color(70, 80, 90, 200)
+local COLOR_ENDTIME_TEXT = Color(220, 225, 230)
+local COLOR_ENDTIME_HEADER = Color(25, 30, 35, 255)
+local COLOR_ENDTIME_HEADER_TEXT = Color(180, 190, 200)
+local function IsEmptyValue(val)
+if val == nil then return true end
+if val == 0 then return true end
+if val == "0" then return true end
+if val == "NULL" then return true end
+if val == "null" then return true end
+if type(val) == "string" and string.Trim(val) == "" then return true end
+return false
+end
+local function NormalizeSteamID(steamid)
+if not steamid or steamid == "Неизвестно" or steamid == "0" then return "Неизвестно" end
+local sid = tostring(steamid)
+if string.match(sid, "^STEAM_0:%d+:%d+$") then return sid end
+if string.match(sid, "^7656") then
+local id64 = tonumber(sid)
+if id64 then
+local x = (id64 - 76561197960265728) % 2
+local y = math.floor((id64 - 76561197960265728 - x) / 2)
+return string.format("STEAM_0:%d:%d", x, y)
+end
+end
+return sid
+end
+local function ParseDurationClient(duration)
+if not duration then return 0 end
+local dur = tostring(duration)
+local minutes = string.match(dur, "^(%d+)mi$")
+if minutes then return tonumber(minutes) * 60 end
+local hours = string.match(dur, "^(%d+)h$")
+if hours then return tonumber(hours) * 3600 end
+local days = string.match(dur, "^(%d+)d$")
+if days then return tonumber(days) * 86400 end
+local seconds = string.match(dur, "^(%d+)s$")
+if seconds then return tonumber(seconds) end
+local num = tonumber(dur)
+if num then return num end
+return 0
+end
+local function FormatDurationShort(seconds)
+if seconds <= 0 then return "Перм" end
+if seconds >= 3600 * 24 then
+return math.floor(seconds / (3600 * 24)) .. "д"
+elseif seconds >= 3600 then
+return math.floor(seconds / 3600) .. "ч"
+elseif seconds >= 60 then
+return math.floor(seconds / 60) .. "м"
+else
+return seconds .. "с"
+end
+end
+local function CreatePlayerSelectMenu()
+if IsValid(_G.PlayerSelectMenuFrame) then
+_G.PlayerSelectMenuFrame:Remove()
+end
+local frame = vgui.Create("DFrame")
+_G.PlayerSelectMenuFrame = frame
+frame:SetSize(600, 450)
+frame:SetTitle("")
+frame:Center()
+frame:MakePopup()
+frame:SetDeleteOnClose(true)
+frame:SetDraggable(true)
+frame:ShowCloseButton(false)
+frame.Paint = function(self, w, h)
+draw.RoundedBox(4, 0, 0, w, h, COLOR_BG)
+end
+local headerPanel = vgui.Create("DPanel", frame)
+headerPanel:Dock(TOP)
+headerPanel:SetTall(45)
+headerPanel.Paint = function(self, w, h)
+draw.RoundedBoxEx(4, 0, 0, w, h, COLOR_HEADER, true, true, false, false)
+end
+local titleLabel = vgui.Create("DLabel", headerPanel)
+titleLabel:Dock(LEFT)
+titleLabel:DockMargin(15, 0, 0, 0)
+titleLabel:SetText("Выберите игрока")
+titleLabel:SetFont("DermaDefaultBold")
+titleLabel:SetTextColor(COLOR_HEADER_TEXT)
+titleLabel:SizeToContents()
+titleLabel:SetContentAlignment(4)
+local closeBtn = vgui.Create("DButton", headerPanel)
+closeBtn:Dock(RIGHT)
+closeBtn:DockMargin(0, 0, 15, 0)
+closeBtn:SetText("Закрыть")
+closeBtn:SetFont("DermaDefaultBold")
+closeBtn:SetTextColor(COLOR_CLOSE_BTN)
+closeBtn:SizeToContents()
+closeBtn:SetContentAlignment(5)
+closeBtn.Paint = function(self, w, h)
+self:SetTextColor(self:IsHovered() and COLOR_CLOSE_BTN_HOVER or COLOR_CLOSE_BTN)
+end
+closeBtn.DoClick = function() frame:Close() end
+local divider = vgui.Create("DPanel", frame)
+divider:Dock(TOP)
+divider:SetTall(1)
+divider.Paint = function(self, w, h)
+draw.RoundedBox(0, 0, 0, w, h, COLOR_DIVIDER)
+end
+local searchPanel = vgui.Create("DPanel", frame)
+searchPanel:Dock(TOP)
+searchPanel:SetTall(35)
+searchPanel:DockMargin(10, 5, 10, 5)
+searchPanel.Paint = function() end
+local searchEntry = vgui.Create("DTextEntry", searchPanel)
+searchEntry:Dock(FILL)
+searchEntry:SetPlaceholderText("Поиск по нику...")
+searchEntry.Paint = function(self, w, h)
+draw.RoundedBox(2, 0, 0, w, h, Color(35, 35, 35))
+self:DrawTextEntryText(COLOR_TEXT, COLOR_ROW_SELECTED, COLOR_TEXT)
+end
+local list = vgui.Create("DListView", frame)
+list:Dock(FILL)
+list:DockMargin(10, 5, 10, 10)
+list:SetMultiSelect(false)
+list:SetDataHeight(28)
+list:SetHeaderHeight(28)
+list:AddColumn("Имя"):SetWidth(250)
+list:AddColumn("SteamID"):SetWidth(220)
+list:AddColumn("Статус"):SetWidth(100)
+list.Paint = function(self, w, h)
+draw.RoundedBox(2, 0, 0, w, h, COLOR_LIST_BG)
+end
+if list.Canvas then
+list.Canvas.Paint = function(self, w, h)
+draw.RoundedBox(0, 0, 0, w, h, COLOR_LIST_BG)
+end
+end
+if list.Columns then
+for _, col in pairs(list.Columns) do
+if IsValid(col) and col.Header then
+col.Header.Paint = function(self, w, h)
+draw.RoundedBox(0, 0, 0, w, h, COLOR_HEADER_COL)
+draw.SimpleText(self:GetText(), "DermaDefaultBold", w/2, h/2, COLOR_HEADER_COL_TEXT, TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
+end
+end
+end
+end
+net.Start("ba.RequestPlayersList")
+net.SendToServer()
+net.Receive("ba.SendPlayersList", function()
+local players = net.ReadTable()
+list:Clear()
+for _, ply in ipairs(players) do
+local steamid32 = NormalizeSteamID(ply.steamid)
+local line = list:AddLine(ply.name, steamid32, ply.admin and "Админ" or "Игрок")
+line.Paint = function(self, w, h)
+if self:IsSelected() then
+draw.RoundedBox(0, 0, 0, w, h, COLOR_ROW_SELECTED)
+elseif self:IsHovered() then
+draw.RoundedBox(0, 0, 0, w, h, COLOR_ROW_HOVER)
+else
+draw.RoundedBox(0, 0, 0, w, h, COLOR_ROW_BG_1)
+end
+end
+if line.Columns then
+for col = 1, #line.Columns do
+local label = line.Columns[col]
+if IsValid(label) then
+label:SetFont("DermaDefault")
+label:SetContentAlignment(4)
+label:DockMargin(8, 0, 0, 0)
+if col == 2 then
+label:SetTextColor(COLOR_STEAMID)
+elseif col == 3 then
+label:SetTextColor(ply.admin and COLOR_ADMIN or COLOR_TEXT_DIM)
+else
+label:SetTextColor(COLOR_TEXT)
+end
+end
+end
+end
+line.OnClick = function()
+RunConsoleCommand("ba", "punishhistory", ply.steamid)
+frame:Close()
+end
+line.OnDoubleClick = function()
+SetClipboardText(steamid32)
+ShowCopyNotification("SteamID: " .. steamid32)
+frame:Close()
+end
+end
+end)
+searchEntry.OnValueChange = function(self, val)
+val = string.lower(val)
+for _, line in ipairs(list:GetLines()) do
+local name = line:GetValue(1) or ""
+local visible = string.find(string.lower(name), val, 1, true) ~= nil
+line:SetVisible(visible)
+end
+end
+return frame
+end
+local function ShowCopyNotification(text)
+local notif = vgui.Create("DLabel")
+notif:SetText("Скопировано: " .. text)
+notif:SetFont("DermaDefaultBold")
+notif:SetTextColor(Color(100, 255, 100))
+notif:SizeToContents()
+notif:SetPos(ScrW() / 2 - notif:GetWide() / 2, ScrH() - 100)
+notif:MakePopup()
+timer.Simple(2, function()
+if IsValid(notif) then
+notif:AlphaTo(0, 0.5, 0, function()
+if IsValid(notif) then notif:Remove() end
+end)
+end
+end)
+end
+local _allPunishments = {}
+local _currentSteamID = ""
+local _currentPunishType = "all"
+local function CreatePunishmentsMenu(steamid, punishments, punish_type)
+if IsValid(_G.PunishmentsMenuFrame) then
+_G.PunishmentsMenuFrame:Remove()
+end
+if not punish_type or punish_type == "" then
+punish_type = "all"
+end
+_allPunishments = punishments or {}
+_currentSteamID = steamid
+_currentPunishType = punish_type
+print("[CLIENT] Создание меню: steamid=", steamid, "type=", punish_type, "count=", #_allPunishments)
+local frame = vgui.Create("DFrame")
+_G.PunishmentsMenuFrame = frame
+frame:SetSize(1400, 520)
+frame:SetTitle("")
+frame:Center()
+frame:MakePopup()
+frame:SetDeleteOnClose(true)
+frame:SetDraggable(true)
+frame:ShowCloseButton(false)
+frame.Paint = function(self, w, h)
+draw.RoundedBox(4, 0, 0, w, h, COLOR_BG)
+end
+local headerPanel = vgui.Create("DPanel", frame)
+headerPanel:Dock(TOP)
+headerPanel:SetTall(42)
+headerPanel.Paint = function(self, w, h)
+draw.RoundedBoxEx(4, 0, 0, w, h, COLOR_HEADER, true, true, false, false)
+end
+local titleLabel = vgui.Create("DLabel", headerPanel)
+titleLabel:Dock(LEFT)
+titleLabel:DockMargin(15, 0, 0, 0)
+titleLabel:SetText("Наказания: " .. NormalizeSteamID(steamid) .. " (0)")
+titleLabel:SetFont("DermaDefaultBold")
+titleLabel:SetTextColor(COLOR_HEADER_TEXT)
+titleLabel:SizeToContents()
+titleLabel:SetContentAlignment(4)
+local closeBtn = vgui.Create("DButton", headerPanel)
+closeBtn:Dock(RIGHT)
+closeBtn:DockMargin(0, 0, 15, 0)
+closeBtn:SetText("Закрыть")
+closeBtn:SetFont("DermaDefaultBold")
+closeBtn:SetTextColor(COLOR_CLOSE_BTN)
+closeBtn:SizeToContents()
+closeBtn:SetContentAlignment(5)
+closeBtn.Paint = function(self, w, h)
+self:SetTextColor(self:IsHovered() and COLOR_CLOSE_BTN_HOVER or COLOR_CLOSE_BTN)
+end
+closeBtn.DoClick = function() frame:Close() end
+local divider = vgui.Create("DPanel", frame)
+divider:Dock(TOP)
+divider:SetTall(1)
+divider.Paint = function(self, w, h)
+draw.RoundedBox(0, 0, 0, w, h, COLOR_DIVIDER)
+end
+local filterPanel = vgui.Create("DPanel", frame)
+filterPanel:Dock(TOP)
+filterPanel:SetTall(36)
+filterPanel.Paint = function(self, w, h)
+draw.RoundedBox(0, 0, 0, w, h, Color(10, 12, 14, 255))
+end
+local filterBtn = vgui.Create("DButton", filterPanel)
+filterBtn:SetWide(220)
+filterBtn:Dock(LEFT)
+filterBtn:DockMargin(10, 5, 0, 5)
+filterBtn:SetText("")
+local filterTypes = {
+{id = "all", name = "Все наказания"},
+{id = "ban", name = "Баны"},
+{id = "mute", name = "Муты чата"},
+{id = "voice_mute", name = "Муты голоса"}
+}
+local currentFilter = _currentPunishType
+if currentFilter == "" or not currentFilter then currentFilter = "all" end
+local function GetFilterName(ftype)
+for _, ft in ipairs(filterTypes) do
+if ft.id == ftype then return ft.name end
+end
+return "Все наказания"
+end
+local function GetFilteredCount(ftype)
+if ftype == "all" then return #_allPunishments end
+local count = 0
+for _, pun in ipairs(_allPunishments) do
+local ptype = pun.punish_type or pun.type or "ban"
+if ptype == ftype then count = count + 1 end
+end
+return count
+end
+filterBtn.Paint = function(self, w, h)
+draw.RoundedBox(3, 0, 0, w, h, COLOR_FILTER_BG)
+surface.SetDrawColor(COLOR_FILTER_BORDER)
+surface.DrawOutlinedRect(0, 0, w, h, 1)
+local text = GetFilterName(currentFilter) .. " (" .. GetFilteredCount(currentFilter) .. ")"
+draw.SimpleText(text, "DermaDefaultBold", 10, h/2, COLOR_FILTER_TEXT, TEXT_ALIGN_LEFT, TEXT_ALIGN_CENTER)
+if self:IsHovered() then
+draw.RoundedBox(3, 0, 0, w, h, COLOR_FILTER_HOVER)
+surface.SetDrawColor(COLOR_FILTER_BORDER)
+surface.DrawOutlinedRect(0, 0, w, h, 1)
+end
+end
+local dropdownOpen = false
+local dropdownPanel = nil
+local function CloseDropdown()
+if IsValid(dropdownPanel) then
+dropdownPanel:Remove()
+dropdownPanel = nil
+end
+dropdownOpen = false
+end
+filterBtn.DoClick = function()
+if dropdownOpen then
+CloseDropdown()
+return
+end
+dropdownOpen = true
+dropdownPanel = vgui.Create("DPanel", frame)
+dropdownPanel:SetWide(220)
+dropdownPanel:SetTall(#filterTypes * 30 + 4)
+local bx, by = filterBtn:LocalToScreen(0, 0)
+dropdownPanel:SetPos(bx, by + 36)
+dropdownPanel:MakePopup()
+dropdownPanel.Paint = function(self, w, h)
+draw.RoundedBox(3, 0, 0, w, h, COLOR_FILTER_DROPDOWN)
+surface.SetDrawColor(COLOR_FILTER_BORDER)
+surface.DrawOutlinedRect(0, 0, w, h, 1)
+end
+for idx, ft in ipairs(filterTypes) do
+local itemBtn = vgui.Create("DButton", dropdownPanel)
+itemBtn:Dock(TOP)
+itemBtn:DockMargin(2, 2, 2, 0)
+itemBtn:SetTall(28)
+itemBtn:SetText("")
+local isActive = currentFilter == ft.id
+itemBtn.Paint = function(self2, w2, h2)
+if isActive then
+draw.RoundedBox(2, 0, 0, w2, h2, Color(50, 70, 90, 240))
+elseif self2:IsHovered() then
+draw.RoundedBox(2, 0, 0, w2, h2, COLOR_FILTER_ITEM_HOVER)
+end
+local count = GetFilteredCount(ft.id)
+local itemText = ft.name .. " (" .. count .. ")"
+draw.SimpleText(itemText, "DermaDefault", 10, h2/2, COLOR_FILTER_TEXT, TEXT_ALIGN_LEFT, TEXT_ALIGN_CENTER)
+end
+itemBtn.DoClick = function()
+currentFilter = ft.id
+CloseDropdown()
+if IsValid(frame) then
+frame:Close()
+end
+RunConsoleCommand("ba", "punishhistory_type", steamid, ft.id)
+end
+end
+end
+local list = vgui.Create("DListView", frame)
+list:Dock(FILL)
+list:DockMargin(5, 5, 5, 5)
+list:SetMultiSelect(false)
+list:SetDataHeight(26)
+list:SetHeaderHeight(26)
+-- Новые колонки: Дата, Игрок, SteamID игрока, Причина, Админ, SteamID админа, Срок, Окончание, Причина снятия, Статус
+list:AddColumn("Дата"):SetWidth(120)
+list:AddColumn("Игрок"):SetWidth(150)
+list:AddColumn("SteamID игрока"):SetWidth(140)
+list:AddColumn("Причина"):SetWidth(200)
+list:AddColumn("Админ"):SetWidth(130)
+list:AddColumn("SteamID админа"):SetWidth(140)
+list:AddColumn("Срок"):SetWidth(70)
+list:AddColumn("Окончание"):SetWidth(120)
+list:AddColumn("Причина снятия"):SetWidth(180)
+list:AddColumn("Статус"):SetWidth(150)
+list.Paint = function(self, w, h)
+draw.RoundedBox(2, 0, 0, w, h, COLOR_LIST_BG)
+end
+if list.Canvas then
+list.Canvas.Paint = function(self, w, h)
+draw.RoundedBox(0, 0, 0, w, h, COLOR_LIST_BG)
+end
+end
+if list.VBar then
+list.VBar.Paint = function(self, w, h)
+draw.RoundedBox(2, 0, 0, w, h, COLOR_SCROLLBAR_BG)
+end
+if list.VBar.btnUp then
+list.VBar.btnUp.Paint = function(self, w, h)
+draw.RoundedBox(2, 0, 0, w, h, COLOR_SCROLLBAR_BTN)
+end
+end
+if list.VBar.btnDown then
+list.VBar.btnDown.Paint = function(self, w, h)
+draw.RoundedBox(2, 0, 0, w, h, COLOR_SCROLLBAR_BTN)
+end
+end
+if list.VBar.btnGrip then
+list.VBar.btnGrip.Paint = function(self, w, h)
+draw.RoundedBox(2, 0, 0, w, h, Color(70, 80, 90, 240))
+end
+end
+end
+if list.Columns then
+local colIdx = 0
+for _, col in pairs(list.Columns) do
+colIdx = colIdx + 1
+if IsValid(col) and col.Header then
+local headerIdx = colIdx
+col.Header.Paint = function(self, w, h)
+if headerIdx == 4 then
+-- Причина
+draw.RoundedBox(0, 0, 0, w, h, COLOR_REASON_HEADER)
+draw.SimpleText(self:GetText(), "DermaDefaultBold", w/2, h/2, COLOR_REASON_HEADER_TEXT, TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
+surface.SetDrawColor(COLOR_REASON_BORDER)
+surface.DrawOutlinedRect(0, 0, w, h, 1)
+elseif headerIdx == 10 then
+-- Статус
+draw.RoundedBox(0, 0, 0, w, h, COLOR_STATUS_HEADER)
+draw.SimpleText(self:GetText(), "DermaDefaultBold", w/2, h/2, COLOR_STATUS_HEADER_TEXT, TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
+surface.SetDrawColor(COLOR_STATUS_BORDER)
+surface.DrawOutlinedRect(0, 0, w, h, 1)
+elseif headerIdx == 9 then
+-- Причина снятия
+draw.RoundedBox(0, 0, 0, w, h, COLOR_UNBAN_HEADER)
+draw.SimpleText(self:GetText(), "DermaDefaultBold", w/2, h/2, COLOR_UNBAN_HEADER_TEXT, TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
+surface.SetDrawColor(COLOR_UNBAN_BORDER)
+surface.DrawOutlinedRect(0, 0, w, h, 1)
+elseif headerIdx == 8 then
+-- Окончание
+draw.RoundedBox(0, 0, 0, w, h, COLOR_ENDTIME_HEADER)
+draw.SimpleText(self:GetText(), "DermaDefaultBold", w/2, h/2, COLOR_ENDTIME_HEADER_TEXT, TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
+surface.SetDrawColor(COLOR_ENDTIME_BORDER)
+surface.DrawOutlinedRect(0, 0, w, h, 1)
+else
+draw.RoundedBox(0, 0, 0, w, h, COLOR_HEADER_COL)
+draw.SimpleText(self:GetText(), "DermaDefaultBold", w/2, h/2, COLOR_HEADER_COL_TEXT, TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
+surface.SetDrawColor(COLOR_BORDER)
+surface.DrawLine(w - 1, 0, w - 1, h)
+end
+end
+end
+end
+end
+local currentTime = os.time()
+local filteredPunishments = {}
+for _, pun in ipairs(punishments) do
+local ptype = pun.punish_type or pun.type or "ban"
+if currentFilter == "all" or ptype == currentFilter then
+table.insert(filteredPunishments, pun)
+end
+end
+print("[CLIENT] Отфильтровано записей:", #filteredPunishments, "из", #punishments)
+for i, pun in ipairs(filteredPunishments) do
+local ptype = pun.punish_type or pun.type or "ban"
+-- Дата
+local date = "Неизвестно"
+local time_val = pun.ban_time or pun.mute_time or pun.timestamp or pun.created
+if time_val and tonumber(time_val) then
+date = os.date("%d.%m.%Y %H:%M", tonumber(time_val))
+end
+-- Игрок (SteamID)
+local playerSteamID = NormalizeSteamID(steamid)
+-- SteamID игрока (то же самое)
+local playerSteamIDFull = playerSteamID
+-- Причина
+local reason = pun.reason or "Не указана"
+if reason == "<reason>" then reason = "Не указана" end
+-- Админ
+local admin = pun.a_name or pun.admin_name or "Неизвестно"
+-- SteamID админа
+local adminSteamID = "Неизвестно"
+if pun.a_steamid or pun.admin_steamid then
+adminSteamID = NormalizeSteamID(pun.a_steamid or pun.admin_steamid)
+end
+-- Срок
+local durationText = "Перм"
+local length_seconds = 0
+local length_val = pun.ban_len or pun.mute_len or pun.length or pun.duration
+if length_val then
+length_seconds = ParseDurationClient(length_val)
+if length_seconds > 0 then
+durationText = FormatDurationShort(length_seconds)
+end
+end
+-- Окончание
+local endTimeText = "—"
+local end_time = nil
+if length_seconds > 0 and time_val and tonumber(time_val) then
+end_time = tonumber(time_val) + length_seconds
+endTimeText = os.date("%d.%m.%Y %H:%M", end_time)
+end
+-- Причина снятия
+local unbanReasonText = "—"
+local unban_time_val = pun.unban_time or pun.unmute_time
+local unban_reason_val = pun.unban_reason or pun.unmute_reason
+local unban_time_num = tonumber(unban_time_val)
+local has_unban_reason = not IsEmptyValue(unban_reason_val)
+if unban_time_num and unban_time_num > 0 and has_unban_reason then
+local raw_reason = unban_reason_val
+if isnumber(raw_reason) then
+unbanReasonText = "Администратор (ID: " .. raw_reason .. ")"
+elseif isstring(raw_reason) then
+raw_reason = string.Trim(raw_reason)
+raw_reason = string.gsub(raw_reason, '"', '')
+if raw_reason == "" or raw_reason == "0" then
+unbanReasonText = "Истёк срок"
+else
+local admin_id, admin_info = string.match(raw_reason, "^(%d+)%s+%[(.+)%]$")
+if admin_id and admin_info then
+if string.find(admin_info, "STEAM_", 1, true) then
+unbanReasonText = NormalizeSteamID(admin_info)
+else
+unbanReasonText = admin_info
+end
+else
+local lower_reason = string.lower(raw_reason)
+if string.find(lower_reason, "замен", 1, true) then
+unbanReasonText = "Заменён"
+else
+unbanReasonText = raw_reason
+end
+end
+end
+end
+end
+-- Статус
+local statusText = "Активен"
+local statusColor = COLOR_STATUS_ACTIVE
+if unban_time_num and unban_time_num > 0 and has_unban_reason then
+statusText = "Снят"
+statusColor = COLOR_STATUS_REMOVED
+else
+if end_time and currentTime > end_time then
+statusText = "Истёк срок"
+statusColor = COLOR_STATUS_EXPIRED
+else
+statusText = "Активен"
+statusColor = COLOR_STATUS_ACTIVE
+end
+end
+-- Добавляем строку: Дата, Игрок, SteamID игрока, Причина, Админ, SteamID админа, Срок, Окончание, Причина снятия, Статус
+local line = list:AddLine(date, playerSteamID, playerSteamIDFull, reason, admin, adminSteamID, durationText, endTimeText, unbanReasonText, statusText)
+local rowBg = (i % 2 == 0) and COLOR_ROW_BG_2 or COLOR_ROW_BG_1
+line.Paint = function(self, w, h)
+if self:IsSelected() then
+draw.RoundedBox(0, 0, 0, w, h, COLOR_ROW_SELECTED)
+elseif self:IsHovered() then
+draw.RoundedBox(0, 0, w, h, COLOR_ROW_HOVER)
+else
+draw.RoundedBox(0, 0, w, h, rowBg)
+end
+surface.SetDrawColor(COLOR_BORDER)
+surface.DrawLine(0, h - 1, w, h - 1)
+end
+if line.Columns then
+for col = 1, #line.Columns do
+local label = line.Columns[col]
+if IsValid(label) then
+label:SetFont("DermaDefault")
+label:SetContentAlignment(4)
+label:DockMargin(8, 0, 0, 0)
+if col == 4 then
+-- Причина
+label:SetTextColor(COLOR_REASON_TEXT)
+label:SetFont("DermaDefaultBold")
+if label.GetParent and IsValid(label:GetParent()) then
+local cellPanel = label:GetParent()
+cellPanel.Paint = function(self2, cw, ch)
+local reasonBg = (i % 2 == 0) and COLOR_REASON_BG_2 or COLOR_REASON_BG_1
+draw.RoundedBox(2, 2, 2, cw - 4, ch - 4, reasonBg)
+surface.SetDrawColor(COLOR_REASON_BORDER)
+surface.DrawOutlinedRect(2, 2, cw - 4, ch - 4, 1)
+end
+end
+elseif col == 10 then
+-- Статус
+label:SetTextColor(statusColor)
+label:SetFont("DermaDefaultBold")
+if label.GetParent and IsValid(label:GetParent()) then
+local cellPanel = label:GetParent()
+cellPanel.Paint = function(self2, cw, ch)
+local statusBg = (i % 2 == 0) and COLOR_STATUS_BG_2 or COLOR_STATUS_BG_1
+draw.RoundedBox(2, 2, 2, cw - 4, ch - 4, statusBg)
+surface.SetDrawColor(COLOR_STATUS_BORDER)
+surface.DrawOutlinedRect(2, 2, cw - 4, ch - 4, 1)
+end
+end
+elseif col == 9 then
+-- Причина снятия
+label:SetTextColor(COLOR_UNBAN_TEXT)
+if label.GetParent and IsValid(label:GetParent()) then
+local cellPanel = label:GetParent()
+cellPanel.Paint = function(self2, cw, ch)
+local unbanBg = (i % 2 == 0) and COLOR_UNBAN_BG_2 or COLOR_UNBAN_BG_1
+draw.RoundedBox(2, 2, 2, cw - 4, ch - 4, unbanBg)
+surface.SetDrawColor(COLOR_UNBAN_BORDER)
+surface.DrawOutlinedRect(2, 2, cw - 4, ch - 4, 1)
+end
+end
+elseif col == 8 then
+-- Окончание
+label:SetTextColor(COLOR_ENDTIME_TEXT)
+if label.GetParent and IsValid(label:GetParent()) then
+local cellPanel = label:GetParent()
+cellPanel.Paint = function(self2, cw, ch)
+local endBg = (i % 2 == 0) and COLOR_ENDTIME_BG_2 or COLOR_ENDTIME_BG_1
+draw.RoundedBox(2, 2, 2, cw - 4, ch - 4, endBg)
+surface.SetDrawColor(COLOR_ENDTIME_BORDER)
+surface.DrawOutlinedRect(2, 2, cw - 4, ch - 4, 1)
+end
+end
+elseif col == 2 or col == 3 then
+-- Игрок / SteamID игрока
+label:SetTextColor(COLOR_STEAMID)
+elseif col == 5 then
+-- Админ
+label:SetTextColor(COLOR_ADMIN)
+elseif col == 6 then
+-- SteamID админа
+label:SetTextColor(COLOR_STEAMID)
+elseif col == 1 then
+-- Дата
+label:SetTextColor(COLOR_TEXT_DIM)
+else
+label:SetTextColor(COLOR_TEXT)
+end
+end
+end
+end
+line.OnClick = function()
+local copyText = string.format("Дата: %s | Игрок: %s | Причина: %s | Админ: %s | Срок: %s | Окончание: %s | Причина снятия: %s | Статус: %s",
+date, playerSteamID, reason, admin, durationText, endTimeText, unbanReasonText, statusText)
+SetClipboardText(copyText)
+ShowCopyNotification(reason)
+end
+line.OnDoubleClick = function()
+SetClipboardText(steamid)
+ShowCopyNotification("SteamID: " .. NormalizeSteamID(steamid))
+end
+end
+titleLabel:SetText("Наказания: " .. NormalizeSteamID(steamid) .. " (" .. #filteredPunishments .. ")")
+titleLabel:SizeToContents()
+return frame
+end
+net.Receive("ba.OpenPunishmentsMenu", function(len)
+local steamid = net.ReadString()
+local punish_type = net.ReadString()
+local punishments = net.ReadTable()
+print("[CLIENT] Получено меню: steamid=", steamid, "type=", punish_type, "count=", #punishments)
+CreatePunishmentsMenu(steamid, punishments, punish_type)
+end)
+net.Receive("ba.OpenPlayerSelectMenu", function(len)
+CreatePlayerSelectMenu()
+end)
+properties.Add("view_punishments_history", {
+MenuLabel = "История наказаний",
+Order = 999,
+MenuIcon = "icon16/application_view_list.png",
+Filter = function(self, ent, pl)
+if not IsValid(ent) or not ent:IsPlayer() then return false end
+if ent == pl then return true end
+return pl:IsAdmin() or pl:IsSuperAdmin()
+end,
+Action = function(self, ent)
+if not IsValid(ent) then return end
+RunConsoleCommand("ba", "punishhistory", ent:SteamID())
+end
+})
+hook.Add("PopulateToolMenu", "PunishmentsMenuTool", function()
+spawnmenu.AddToolMenuOption("Utilities", "Admin", "PunishmentsHistory", "История наказаний", "", "", function(panel)
+panel:ClearControls()
+panel:SetName("История наказаний")
+local btn1 = vgui.Create("DButton", panel)
+btn1:SetText("Открыть список игроков")
+btn1:Dock(TOP)
+btn1:DockMargin(0, 5, 0, 5)
+btn1.DoClick = function()
+RunConsoleCommand("ba", "punishhistory")
+end
+panel:AddItem(btn1)
+panel:Help("Или введите SteamID/ник:")
+local textEntry = panel:TextEntry("SteamID / Ник")
+textEntry:SetValue("")
+local btn2 = vgui.Create("DButton", panel)
+btn2:SetText("Открыть историю")
+btn2:Dock(TOP)
+btn2:DockMargin(0, 5, 0, 5)
+btn2.DoClick = function()
+local val = textEntry:GetValue()
+if val and val ~= "" then
+RunConsoleCommand("ba", "punishhistory", val)
+else
+RunConsoleCommand("ba", "punishhistory")
+end
+end
+panel:AddItem(btn2)
+panel:Help("")
+panel:Help("Команды:")
+panel:Help("• ba punishhistory <ник/steamid> (только админы)")
+panel:Help("• ba ph <ник/steamid> (только админы)")
+panel:Help("• ba_mypunish (все игроки - свои наказания)")
+panel:Help("• ПКМ по игроку → История наказаний (только админы)")
+end)
+end)
+end

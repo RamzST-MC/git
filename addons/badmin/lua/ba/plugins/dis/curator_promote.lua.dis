@@ -1,0 +1,112 @@
+-------------------------------------------------
+-- Повышение / снятие ранга куратором (только определённые группы)
+--
+-- /promote <ник|steamid> <группа>  - выдать группу (только повышение)
+-- /unrank  <ник|steamid> <причина> - снять группу (игрок станет user), причина обязательна
+-- (/demote занят командой DarkRP - увольнение с профессии)
+--
+-- Куратор не получает флаг '*' (полный /setgroup), а может работать
+-- только с группами из списка CURATOR_GRANT ниже.
+-------------------------------------------------
+
+-- ВАЖНО: ключ = имя ранга куратора в нижнем регистре и без пробелов
+-- (то же, что возвращает pl:GetRank()), значение = какие группы он может выдавать и снимать.
+local CURATOR_GRANT = {
+	['curator']    = { 'probation', 'helper', 'naboradmin' },
+	['subcurator'] = { 'probation', 'helper', 'naboradmin' },
+}
+
+-- список разрешённых групп для куратора или nil, если игрок не куратор
+local function getAllowed(pl)
+	if not isplayer(pl) then return nil end
+	local mine = pl:GetRankTable()
+	return mine and CURATOR_GRANT[mine:GetName()]
+end
+
+-- текущий ранг цели (игрок онлайн или SteamID из базы)
+local function getCurrent(target)
+	if isplayer(target) then
+		return target:GetRankTable()
+	end
+	local id = ba.data.GetRank(ba.InfoTo64(target))
+	return ba.ranks.Get(tonumber(id) or id)
+end
+
+term.Add('UnRank', '# снял ранг # у #. Причина: #')
+
+-- notify: функция, которая сообщает о результате (по умолчанию - сообщение о выдаче ранга)
+local function setRank(pl, target, rankname, notify)
+	ba.data.SetRank(target, rankname, rankname, 0, notify or function()
+		ba.notify_all(term.Get('SetRank'), pl, target, rankname, '', '')
+	end)
+	if IsValid(target) then target:ConCommand('spawnmenu_reload') end
+end
+
+-------------------------------------------------
+-- /promote
+-------------------------------------------------
+ba.cmd.Create('Promote', function(pl, args)
+	-- консоль тут не нужна: у неё есть SetGroup
+	if not isplayer(pl) then return end
+
+	local allowed = getAllowed(pl)
+	if not allowed then
+		return ba.notify_err(pl, 'Эта команда доступна только кураторам!')
+	end
+
+	-- 1. Выдавать можно только разрешённые группы
+	local newrank = ba.ranks.Get(args.rank)
+	if (not newrank) or (not table.HasValue(allowed, newrank:GetName())) then
+		return ba.notify_err(pl, 'Вы можете выдавать только группы: ' .. table.concat(allowed, ', '))
+	end
+
+	-- 2. Только повышение: текущая группа цели должна быть ниже выдаваемой
+	local current = getCurrent(args.target)
+	if current and (current:GetImmunity() >= newrank:GetImmunity()) then
+		return ba.notify_err(pl, 'Это не повышение: у игрока уже группа ' .. current:GetNiceName() .. ' или выше!')
+	end
+
+	setRank(pl, args.target, newrank:GetName())
+end)
+:AddParam('player_steamid', 'target')
+:AddParam('rank', 'rank')
+:SetFlag('u') -- есть у всех рангов; реальная проверка выше, по CURATOR_GRANT
+:SetHelp('Куратор: повысить игрока до разрешённой группы. Пример: /promote (ник) (группа)')
+:SetIcon('icon16/user_add.png')
+
+-------------------------------------------------
+-- /unrank
+-------------------------------------------------
+ba.cmd.Create('UnRank', function(pl, args)
+	if not isplayer(pl) then return end
+
+	local allowed = getAllowed(pl)
+	if not allowed then
+		return ba.notify_err(pl, 'Эта команда доступна только кураторам!')
+	end
+
+	-- снимать можно только те группы, которые куратор сам может выдавать
+	local current = getCurrent(args.target)
+	if (not current) or (current:GetName() == 'user') then
+		return ba.notify_err(pl, 'У игрока нет ранга, который можно снять!')
+	end
+
+	if not table.HasValue(allowed, current:GetName()) then
+		return ba.notify_err(pl, 'Вы можете снимать только группы: ' .. table.concat(allowed, ', '))
+	end
+
+	local reason = string.Trim(args.reason or '')
+	if (reason == '') then
+		return ba.notify_err(pl, 'Укажите причину снятия ранга!')
+	end
+
+	local was = current:GetNiceName()
+	setRank(pl, args.target, 'user', function()
+		ba.notify_all(term.Get('UnRank'), pl, was, args.target, reason)
+	end)
+end)
+:AddParam('player_steamid', 'target')
+:AddParam('string', 'reason')
+:SetFlag('u')
+:SetHelp('Куратор: снять разрешённую группу (игрок станет user). Пример: /unrank (ник) (причина)')
+:SetIcon('icon16/user_delete.png')

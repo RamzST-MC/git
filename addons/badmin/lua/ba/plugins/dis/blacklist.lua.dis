@@ -1,0 +1,395 @@
+-------------------------------------------------
+-- Чёрный список администрации
+--
+-- /blacklist  <ник|steamid> <причина>           - навсегда
+-- /tblacklist <ник|steamid> <время> <причина>   - на время (пример: 7d, 12h, 1w2d)
+-- /unblacklist <ник|steamid>                    - убрать из чёрного списка
+-- /blacklistmenu                                - меню со списком
+--
+-- Причина обязательна. Игрок из чёрного списка:
+--   * лишается админ-ранга (если он у него был, см. STRIP_RANK);
+--   * не может получить админ-ранг (/setgroup, /promote и т.д.) пока запись активна;
+--   * если админ-ранг у него всё же есть (выдан на другом сервере), он снимается при входе.
+-- Записи хранятся в таблице ba_blacklist (MySQL - как остальные данные badmin).
+-------------------------------------------------
+
+-- Кто может добавлять/убирать записи и открывать меню (имя ранга: нижний регистр, без пробелов)
+local MANAGERS = {
+	['curator'] 	= true,
+	['subcurator'] 	= true,
+	['root'] 		= true,
+}
+
+-- Снимать админ-ранг при добавлении в чёрный список
+local STRIP_RANK = true
+
+-- Не больше стольких записей в меню (лимит сетевого сообщения)
+local MENU_LIMIT = 300
+
+-------------------------------------------------
+-- Тексты
+-------------------------------------------------
+term.Add('BlackListAdd', 		'# добавил # в чёрный список администрации (#). Причина: #')
+term.Add('BlackListUpdate', 	'# обновил запись # в чёрном списке администрации (#). Причина: #')
+term.Add('BlackListRemove', 	'# убрал # из чёрного списка администрации')
+term.Add('BlackListExpired', 	'Срок пребывания # в чёрном списке администрации истёк')
+term.Add('BlackListBlocked', 	'Нельзя выдать ранг # игроку #: он в чёрном списке администрации (#). Причина: #')
+
+local function isManager(pl)
+	if not isplayer(pl) then return true end -- консоль сервера
+	local r = pl:GetRankTable()
+	return (r and MANAGERS[r:GetName()]) or false
+end
+
+local BL = {}
+
+-------------------------------------------------
+-- Сервер
+-------------------------------------------------
+if (SERVER) then
+	util.AddNetworkString('ba.BlackListMenu')
+
+	local db
+	local cache = {} -- [steamid64] = запись из ba_blacklist
+
+	local DDL_MYSQL = [[CREATE TABLE IF NOT EXISTS ba_blacklist (
+		steamid BIGINT(20) NOT NULL, name VARCHAR(64), reason TEXT, a_steamid BIGINT(20), a_name VARCHAR(64),
+		added INT(11), expire INT(11) DEFAULT 0, PRIMARY KEY (steamid)) ENGINE=InnoDB DEFAULT CHARSET=utf8;]]
+
+	local function isActive(e)
+		if not e then return false end
+		local ex = tonumber(e.expire) or 0
+		return (ex == 0) or (ex > os.time())
+	end
+
+	local function reload(cback)
+		db:query('SELECT CAST(steamid AS CHAR) AS steamid, name, reason, CAST(a_steamid AS CHAR) AS a_steamid, a_name, added, expire FROM ba_blacklist', function(data)
+			cache = {}
+			for _, r in ipairs(data) do
+				cache[tostring(r.steamid)] = r
+			end
+			if cback then cback() end
+		end)
+	end
+
+	-- в чёрном списке ли игрок/SteamID (только активные записи)
+	function BL.IsBlacklisted(target)
+		return isActive(cache[ba.InfoTo64(target)]), cache[ba.InfoTo64(target)]
+	end
+
+	-- текущий ранг цели (игрок онлайн или SteamID из базы)
+	local function currentRank(target)
+		if isplayer(target) then return target:GetRankTable() end
+		local id = ba.data.GetRank(ba.InfoTo64(target))
+		return ba.ranks.Get(tonumber(id) or id)
+	end
+
+	local function isAdminRank(r)
+		return r and (r:IsAdmin() or r:IsSuperAdmin()) or false
+	end
+
+	-------------------------------------------------
+	-- Блокировка выдачи админ-рангов
+	-------------------------------------------------
+	local origSetRank = ba.data._BlackListOrigSetRank or ba.data.SetRank
+	ba.data._BlackListOrigSetRank = origSetRank
+
+	-- кто сейчас выполняет команду (SetRank не знает, кто его вызвал): playerRunCommand срабатывает
+	-- непосредственно перед выполнением команды, поэтому в самой команде значение ещё актуально
+	local issuer
+	hook.Add('playerRunCommand', 'ba.blacklist.issuer', function(pl)
+		issuer = pl
+		timer.Simple(0, function() issuer = nil end)
+	end)
+
+	function ba.data.SetRank(pl, rank, expire_rank, expire_time, cback)
+		local ro = ba.ranks.Get(rank or 1)
+
+		if isAdminRank(ro) then
+			local bad, entry = BL.IsBlacklisted(pl)
+			if bad then
+				local ex 	= tonumber(entry.expire) or 0
+				local until_ = (ex == 0) and 'навсегда' or ('до ' .. os.date('%d.%m.%Y %H:%M', ex))
+
+				if isplayer(issuer) then
+					-- тому, кто выдаёт ранг
+					ba.notify_err(issuer, term.Get('BlackListBlocked'), ro:GetNiceName(), pl, until_, tostring(entry.reason or ''))
+				else
+					ba.notify_staff(term.Get('BlackListBlocked'), ro:GetNiceName(), pl, until_, tostring(entry.reason or ''))
+				end
+				return
+			end
+		end
+
+		return origSetRank(pl, rank, expire_rank, expire_time, cback)
+	end
+
+	-- при входе: админ-ранг у игрока из чёрного списка снимаем
+	hook.Add('playerRankLoaded', 'ba.blacklist.join', function(pl)
+		if not STRIP_RANK then return end
+		if not BL.IsBlacklisted(pl) then return end
+
+		local r = pl:GetRankTable()
+		if isAdminRank(r) then
+			origSetRank(pl, 'user', 'user', 0)
+			ba.notify_staff('# в чёрном списке администрации - ранг # снят при входе', pl, r:GetNiceName())
+		end
+	end)
+
+	-------------------------------------------------
+	-- Добавление / удаление
+	-------------------------------------------------
+	local function withName(target, cback)
+		if isplayer(target) then
+			local name, steam = target:Nick(), target:SteamName()
+			if steam and (steam ~= '') and (steam ~= name) then
+				name = name .. ' (Steam: ' .. steam .. ')'
+			end
+			-- столбец name - VARCHAR(64)
+			return cback((string.utf8sub and string.utf8sub(name, 1, 60)) or name:sub(1, 60))
+		end
+
+		db:query_ex('SELECT name FROM ba_users WHERE steamid=?', {ba.InfoTo64(target)}, function(d)
+			cback((d[1] and d[1].name) or 'Неизвестный')
+		end)
+	end
+
+	-- seconds = 0 - навсегда
+	function BL.Add(pl, target, reason, seconds, rawTime)
+		local sid = ba.InfoTo64(target)
+
+		-- куратора в чёрный список добавить нельзя
+		local cur = currentRank(target)
+		if cur and MANAGERS[cur:GetName()] then
+			return ba.notify_err(pl, 'Нельзя добавить куратора в чёрный список!')
+		end
+
+		local existed = isActive(cache[sid])
+		local expire  = (seconds > 0) and (os.time() + seconds) or 0
+		local aname   = isplayer(pl) and pl:Nick() or 'Консоль'
+		local asid    = isplayer(pl) and pl:SteamID64() or '0'
+
+		withName(target, function(name)
+			cache[sid] = {steamid = sid, name = name, reason = reason, a_steamid = asid, a_name = aname, added = os.time(), expire = expire}
+
+			db:query_ex('REPLACE INTO ba_blacklist(steamid, name, reason, a_steamid, a_name, added, expire) VALUES("?","?","?","?","?",?,?)',
+				{sid, name, reason, asid, aname, os.time(), expire})
+
+			if STRIP_RANK and isAdminRank(cur) then
+				origSetRank(target, 'user', 'user', 0)
+			end
+
+			ba.notify_all(term.Get(existed and 'BlackListUpdate' or 'BlackListAdd'), pl, target, (seconds > 0) and ('на ' .. rawTime) or 'навсегда', reason)
+			hook.Call('BA_BlackListAdded', nil, pl, target, reason, expire)
+		end)
+	end
+
+	function BL.Remove(pl, target)
+		local sid = ba.InfoTo64(target)
+
+		if not cache[sid] then
+			return ba.notify_err(pl, 'Этого игрока нет в чёрном списке!')
+		end
+
+		cache[sid] = nil
+		db:query_ex('DELETE FROM ba_blacklist WHERE steamid=?', {sid})
+
+		ba.notify_all(term.Get('BlackListRemove'), pl, target)
+		hook.Call('BA_BlackListRemoved', nil, pl, target)
+	end
+
+	-------------------------------------------------
+	-- Меню
+	-------------------------------------------------
+	function BL.SendMenu(pl)
+		local now = os.time()
+
+		db:query('SELECT CAST(steamid AS CHAR) AS steamid, name, reason, CAST(a_steamid AS CHAR) AS a_steamid, a_name, added, expire FROM ba_blacklist WHERE expire = 0 OR expire > ' .. now .. ' ORDER BY added DESC LIMIT ' .. MENU_LIMIT, function(data)
+			if not IsValid(pl) then return end
+
+			local rows = {}
+			for _, r in ipairs(data) do
+				rows[#rows + 1] = {
+					sid 	= tostring(r.steamid),
+					name 	= tostring(r.name or '?'),
+					reason 	= tostring(r.reason or ''),
+					admin 	= tostring(r.a_name or '?'),
+					added 	= tonumber(r.added) or 0,
+					expire 	= tonumber(r.expire) or 0,
+				}
+			end
+
+			local packed = util.Compress(pon.encode(rows))
+			net.Start('ba.BlackListMenu')
+				net.WriteUInt(#packed, 32)
+				net.WriteData(packed, #packed)
+			net.Send(pl)
+		end)
+	end
+
+	-------------------------------------------------
+	-- Срок действия
+	-------------------------------------------------
+	timer.Create('ba.blacklist.expire', 60, 0, function()
+		local now, expired = os.time(), {}
+
+		for sid, e in pairs(cache) do
+			local ex = tonumber(e.expire) or 0
+			if (ex > 0) and (ex <= now) then expired[#expired + 1] = sid end
+		end
+
+		if (#expired == 0) then return end
+
+		for _, sid in ipairs(expired) do
+			ba.notify_staff(term.Get('BlackListExpired'), tostring(cache[sid].name or sid))
+			cache[sid] = nil
+		end
+
+		db:query('DELETE FROM ba_blacklist WHERE expire > 0 AND expire <= ' .. now)
+	end)
+
+	-------------------------------------------------
+	-- Инициализация
+	-------------------------------------------------
+	db = ba.data.GetDB()
+
+	db:query(DDL_MYSQL)
+	reload()
+end
+
+-------------------------------------------------
+-- Команды
+-------------------------------------------------
+local function noAccess(pl)
+	return ba.notify_err(pl, 'Эта команда доступна только кураторам!')
+end
+
+ba.cmd.Create('BlackList', function(pl, args)
+	if not isManager(pl) then return noAccess(pl) end
+
+	local reason = string.Trim(args.reason or '')
+	if (reason == '') then return ba.notify_err(pl, 'Укажите причину!') end
+
+	BL.Add(pl, args.target, reason, 0)
+end)
+:AddParam('player_steamid', 'target')
+:AddParam('string', 'reason')
+:SetFlag('u') -- есть у всех рангов; реальная проверка выше (MANAGERS)
+:SetHelp('Куратор: добавить в чёрный список администрации НАВСЕГДА. Пример: /blacklist (ник) (причина)')
+:SetIcon('icon16/user_red.png')
+
+ba.cmd.Create('TBlackList', function(pl, args)
+	if not isManager(pl) then return noAccess(pl) end
+
+	local reason = string.Trim(args.reason or '')
+	if (reason == '') then return ba.notify_err(pl, 'Укажите причину!') end
+
+	BL.Add(pl, args.target, reason, args.time, args.raw.time)
+end)
+:AddParam('player_steamid', 'target')
+:AddParam('time', 'time')
+:AddParam('string', 'reason')
+:SetFlag('u')
+:SetHelp('Куратор: добавить в чёрный список администрации НА ВРЕМЯ. Пример: /tblacklist (ник) 7d (причина)')
+:SetIcon('icon16/user_orange.png')
+
+ba.cmd.Create('UnBlackList', function(pl, args)
+	if not isManager(pl) then return noAccess(pl) end
+	BL.Remove(pl, args.target)
+end)
+:AddParam('player_steamid', 'target')
+:SetFlag('u')
+:SetHelp('Куратор: убрать из чёрного списка администрации. Пример: /unblacklist (ник)')
+:SetIcon('icon16/user_green.png')
+
+ba.cmd.Create('BlackListMenu', function(pl)
+	if not isplayer(pl) then return end
+	if not isManager(pl) then return noAccess(pl) end
+	BL.SendMenu(pl)
+end)
+:SetFlag('u')
+:SetHelp('Куратор: открыть список игроков в чёрном списке администрации')
+:SetIcon('icon16/table.png')
+
+-------------------------------------------------
+-- Клиент: меню со списком
+-------------------------------------------------
+if (SERVER) then return end
+
+local fr
+
+local function fmtDate(t)
+	return (t == 0) and 'Навсегда' or os.date('%d.%m.%Y %H:%M', t)
+end
+
+net.Receive('ba.BlackListMenu', function()
+	local size = net.ReadUInt(32)
+	local rows = pon.decode(util.Decompress(net.ReadData(size))) or {}
+
+	if IsValid(fr) then fr:Remove() end
+
+	fr = ui.Create('ui_frame', function(self)
+		self:SetSize(1250, 600)
+		self:SetTitle('Чёрный список администрации (' .. #rows .. ')')
+		self:Center()
+		self:MakePopup()
+	end)
+
+	local list = ui.Create('DListView', function(self, p)
+		-- ui_frame резервирует под шапку GetTitleHeight() (60px), а DockPadding всего 29px
+		self:DockMargin(0, p:GetTitleHeight() - 29, 0, 0)
+		self:Dock(FILL)
+		self:SetMultiSelect(false)
+		self:AddColumn('Ник'):SetFixedWidth(270)
+		self:AddColumn('SteamID'):SetFixedWidth(150)
+		self:AddColumn('SteamID64'):SetFixedWidth(150)
+		self:AddColumn('Причина')
+		self:AddColumn('Кем добавлен'):SetFixedWidth(130)
+		self:AddColumn('Дата'):SetFixedWidth(115)
+		self:AddColumn('До'):SetFixedWidth(115)
+		self:SetHeaderHeight(25)
+	end, fr)
+
+	for _, r in ipairs(rows) do
+		local line = list:AddLine(r.name, util.SteamIDFrom64(r.sid), r.sid, r.reason, r.admin, fmtDate(r.added), fmtDate(r.expire))
+		line.Row = r
+	end
+
+	if (#rows == 0) then
+		list:AddLine('Чёрный список пуст')
+	end
+
+	list.OnRowRightClick = function(_, id, line)
+		local r = line.Row
+		if not r then return end
+
+		local menu = ui.DermaMenu()
+
+		menu:AddOption('Скопировать ник', function()
+			SetClipboardText(r.name)
+			chat.AddText(color_white, 'Ник скопирован: ' .. r.name)
+		end)
+
+		menu:AddOption('Скопировать SteamID', function()
+			SetClipboardText(util.SteamIDFrom64(r.sid))
+			chat.AddText(color_white, 'SteamID скопирован: ' .. util.SteamIDFrom64(r.sid))
+		end)
+
+		menu:AddOption('Скопировать SteamID64', function()
+			SetClipboardText(r.sid)
+			chat.AddText(color_white, 'SteamID64 скопирован: ' .. r.sid)
+		end)
+
+		menu:AddOption('Скопировать причину', function()
+			SetClipboardText(r.reason)
+			chat.AddText(color_white, 'Причина скопирована')
+		end)
+
+		menu:AddOption('Убрать из чёрного списка', function()
+			RunConsoleCommand('ba', 'unblacklist', util.SteamIDFrom64(r.sid))
+			timer.Simple(.8, function() RunConsoleCommand('ba', 'blacklistmenu') end)
+		end)
+
+		menu:Open()
+	end
+end)

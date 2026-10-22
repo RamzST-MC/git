@@ -1,0 +1,143 @@
+AddCSLuaFile()
+
+if (CLIENT) then
+    CreateConVar("cl_drawcameras", "1", 0, "Should the cameras be visible?")
+end
+
+ENT.Type = "anim"
+ENT.Spawnable = false
+ENT.RenderGroup = RENDERGROUP_BOTH
+local CAMERA_MODEL = Model("models/dav0r/camera.mdl")
+
+function ENT:SetupDataTables()
+    self:NetworkVar("Int", 0, "Key")
+    self:NetworkVar("Bool", 0, "On")
+    self:NetworkVar("Vector", 0, "vecTrack")
+    self:NetworkVar("Entity", 0, "entTrack")
+    self:NetworkVar("Entity", 1, "Player")
+end
+
+function ENT:Initialize()
+    if (SERVER) then
+        self:SetModel(CAMERA_MODEL)
+        self:PhysicsInit(SOLID_NONE)
+        self:SetMoveType(MOVETYPE_VPHYSICS)
+        self:SetSolid(SOLID_NONE)
+        self:DrawShadow(false)
+        self:SetCollisionGroup(COLLISION_GROUP_WEAPON)
+        local phys = self:GetPhysicsObject()
+
+        if (phys:IsValid()) then
+            phys:Sleep()
+        end
+
+        if IsValid(self.ItemOwner) then
+            self:CPPISetOwner(self.ItemOwner)
+        end
+    end
+end
+
+function ENT:SetTracking(Ent, LPos)
+    if (Ent:IsValid()) then
+        self:SetMoveType(MOVETYPE_NONE)
+        self:SetSolid(SOLID_BBOX)
+    else
+        self:SetMoveType(MOVETYPE_VPHYSICS)
+        self:SetSolid(SOLID_VPHYSICS)
+    end
+
+    self:NextThink(CurTime())
+    self:SetvecTrack(LPos)
+    self:SetentTrack(Ent)
+end
+
+function ENT:SetLocked(locked)
+    if (locked == 1) then
+        self.PhysgunDisabled = true
+        self:SetMoveType(MOVETYPE_NONE)
+        self:SetSolid(SOLID_BBOX)
+        self:SetCollisionGroup(COLLISION_GROUP_WORLD)
+    else
+        self.PhysgunDisabled = false
+    end
+
+    self.locked = locked
+end
+
+function ENT:OnTakeDamage(dmginfo)
+    if (self.locked) then return end
+    self:TakePhysicsDamage(dmginfo)
+end
+
+function ENT:OnRemove()
+    if (IsValid(self.UsingPlayer)) then
+        self.UsingPlayer:SetViewEntity(self.UsingPlayer)
+    end
+end
+
+if (SERVER) then
+    numpad.Register("Camera_On", function(pl, ent)
+        if (not IsValid(ent)) then return false end
+        pl:SetViewEntity(ent)
+        pl.UsingCamera = ent
+        ent.UsingPlayer = pl
+    end)
+
+    numpad.Register("Camera_Toggle", function(pl, ent, idx, buttoned)
+        if (not IsValid(ent)) then return false end
+        if (not IsValid(pl)) then return false end
+
+        if (pl.UsingCamera and pl.UsingCamera == ent and pl:GetViewEntity() ~= ent) then
+            pl.UsingCamera = nil
+            ent.UsingPlayer = nil
+        end
+
+        if (pl.UsingCamera and pl.UsingCamera == ent) then
+            pl:SetViewEntity(pl)
+            pl.UsingCamera = nil
+            ent.UsingPlayer = nil
+        else
+            pl:SetViewEntity(ent)
+            pl.UsingCamera = ent
+            ent.UsingPlayer = pl
+        end
+    end)
+
+    numpad.Register("Camera_Off", function(pl, ent)
+        if (not IsValid(ent)) then return false end
+
+        if (pl.UsingCamera and pl.UsingCamera == ent) then
+            pl:SetViewEntity(pl)
+            pl.UsingCamera = nil
+            ent.UsingPlayer = nil
+        end
+    end)
+end
+
+function ENT:Think()
+    if (CLIENT) then
+        self:TrackEntity(self:GetentTrack(), self:GetvecTrack())
+    end
+end
+
+function ENT:TrackEntity(ent, lpos)
+    if (not ent or not ent:IsValid()) then return end
+    local WPos = ent:LocalToWorld(lpos)
+
+    if (ent:IsPlayer()) then
+        WPos = WPos + Vector(0, 0, 54)
+    end
+
+    local CamPos = self:GetPos()
+    local Ang = WPos - CamPos
+    Ang = Ang:Angle()
+    self:SetAngles(Ang)
+end
+
+function ENT:Draw()
+    if (GetConVarNumber("cl_drawcameras") == 0) then return end
+    local ply = LocalPlayer()
+    local wep = ply:GetActiveWeapon()
+    if (wep:IsValid()) and (wep:GetClass() == "gmod_camera") then return end
+    self:DrawModel()
+end
